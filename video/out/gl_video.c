@@ -192,9 +192,6 @@ struct gl_video {
 
     struct mp_csp_equalizer video_eq;
 
-    // Source and destination color spaces for the CMS matrix
-    struct mp_csp_primaries csp_src, csp_dest;
-
     struct mp_rect src_rect;    // displayed part of the source video
     struct mp_rect dst_rect;    // video rectangle on output window
     struct mp_osd_res osd_rect; // OSD size/margins
@@ -366,7 +363,19 @@ const struct m_sub_options gl_video_conf = {
     .opts = (const m_option_t[]) {
         OPT_FLOATRANGE("gamma", gamma, 0, 0.1, 2.0),
         OPT_FLAG("gamma-auto", gamma_auto, 0),
-        OPT_FLAG("srgb", srgb, 0),
+        OPT_CHOICE("target-prim", target_prim, 0,
+                   ({"auto",      MP_CSP_PRIM_AUTO},
+                    {"bt601-525", MP_CSP_PRIM_BT_601_525},
+                    {"bt601-625", MP_CSP_PRIM_BT_601_625},
+                    {"bt709",     MP_CSP_PRIM_BT_709},
+                    {"bt2020",    MP_CSP_PRIM_BT_2020},
+                    {"bt470m",    MP_CSP_PRIM_BT_470M})),
+        OPT_CHOICE("target-trc", target_trc, 0,
+                   ({"auto",    MP_CSP_TRC_AUTO},
+                    {"bt1886",  MP_CSP_TRC_BT_1886},
+                    {"srgb",    MP_CSP_TRC_SRGB},
+                    {"linear",  MP_CSP_TRC_LINEAR},
+                    {"gamma22", MP_CSP_TRC_GAMMA22})),
         OPT_FLAG("npot", npot, 0),
         OPT_FLAG("pbo", pbo, 0),
         OPT_STRING_VALIDATE("scale", scalers[0], 0, validate_scaler_opt),
@@ -433,6 +442,7 @@ const struct m_sub_options gl_video_conf = {
         OPT_REPLACED("cparam2", "cscale-param2"),
         OPT_REPLACED("cradius", "cscale-radius"),
         OPT_REPLACED("cantiring", "cscale-antiring"),
+        OPT_REPLACED("srgb", "target-prim=srgb:target-trc=srgb"),
 
         {0}
     },
@@ -1170,12 +1180,8 @@ static void pass_convert_yuv(struct gl_video *p)
     if (!p->is_rgb) {
         struct mp_cmat m = {{{0}}};
         if (p->image_desc.flags & MP_IMGFLAG_XYZ) {
-            // Hard-coded as relative colorimetric for now, since this transforms
-            // from the source file's D55 material to whatever color space our
-            // projector/display lives in, which should be D55 for a proper
-            // home cinema setup either way.
-            mp_get_xyz2rgb_coeffs(&cparams, p->csp_src,
-                                    MP_INTENT_RELATIVE_COLORIMETRIC, &m);
+            struct mp_csp_primaries csp = mp_get_csp_primaries(p->image_params.primaries);
+            mp_get_xyz2rgb_coeffs(&cparams, csp, MP_INTENT_RELATIVE_COLORIMETRIC, &m);
         } else {
             mp_get_yuv2rgb_coeffs(&cparams, &m);
         }
@@ -1255,22 +1261,26 @@ static void pass_scale_main(struct gl_video *p, bool use_indirect)
         scale_factor = FFMAX(1.0, 1.0 / f);
     }
 
-    bool use_srgb = p->opts.srgb;
-    bool use_cms  = use_srgb || p->use_lut_3d;
+    bool use_cms = p->use_lut_3d || p->opts.target_prim != MP_CSP_PRIM_AUTO
+                                 || p->opts.target_trc != MP_CSP_TRC_AUTO;
 
     // Pre-conversion, like linear light/sigmoidization
     GLSLF("// scaler pre-conversion\n");
     bool use_linear = p->opts.linear_scaling || p->opts.sigmoid_upscaling
-                      || use_cms || p->image_desc.flags & MP_IMGFLAG_XYZ;
+                      || use_cms || p->image_params.gamma == MP_CSP_TRC_LINEAR;
     if (use_linear) {
         switch (p->image_params.gamma) {
             case MP_CSP_TRC_SRGB:
                 GLSL(color.rgb = mix(color.rgb / vec3(12.92),
-                                     pow((color.rgb + vec3(0.055))/vec3(1.055), vec3(2.4)),
+                                     pow((color.rgb + vec3(0.055))/vec3(1.055),
+                                         vec3(2.4)),
                                      lessThanEqual(vec3(0.04045), color.rgb));)
                 break;
             case MP_CSP_TRC_BT_1886:
                 GLSL(color.rgb = pow(color.rgb, vec3(1.961));)
+                break;
+            case MP_CSP_TRC_GAMMA22:
+                GLSL(color.rgb = pow(color.rgb, vec3(2.2));)
                 break;
         }
     }
@@ -1308,31 +1318,57 @@ static void pass_scale_main(struct gl_video *p, bool use_indirect)
                 sig_slope, sig_center, sig_offset, sig_scale);
     }
 
-    if (use_linear && !use_cms) {
-        // Inverse of the linear light transformation. Not needed if CMS is
-        // turned on, since it happens automatically in those cases.
-        switch (p->image_params.gamma) {
+    GLSLF("// color management\n");
+    enum mp_csp_trc trc_dst = p->opts.target_trc;
+    enum mp_csp_prim prim_src = p->image_params.primaries,
+                     prim_dst = p->opts.target_prim;
+
+    if (p->use_lut_3d) {
+        // The 3DLUT is hard-coded against BT.2020's gamut during creation, and
+        // we never want to adjust its output (so treat it as linear)
+        prim_dst = MP_CSP_PRIM_BT_2020;
+        trc_dst = MP_CSP_TRC_LINEAR;
+    }
+
+    if (prim_dst == MP_CSP_PRIM_AUTO)
+        prim_dst = prim_src;
+    if (trc_dst == MP_CSP_TRC_AUTO) {
+        trc_dst = p->image_params.gamma;
+        // Pick something more reasonable for linear light inputs
+        if (p->image_params.gamma == MP_CSP_TRC_LINEAR)
+            trc_dst = MP_CSP_TRC_GAMMA22;
+    }
+
+    // Adapt to the right colorspace if necessary
+    if (prim_src != prim_dst) {
+        struct mp_csp_primaries csp_src = mp_get_csp_primaries(prim_src),
+                                csp_dst = mp_get_csp_primaries(prim_dst);
+        float m[3][3] = {{0}};
+        mp_get_cms_matrix(csp_src, csp_dst, MP_INTENT_RELATIVE_COLORIMETRIC, m);
+        gl_sc_uniform_mat3(p->sc, "cms_matrix", true, &m[0][0]);
+        GLSL(color.rgb = cms_matrix * color.rgb;)
+    }
+
+    // TODO: 3dlut
+
+    // Don't perform any gamut mapping unless linear light input is present to
+    // begin with
+    if (use_linear) {
+        switch (trc_dst) {
             case MP_CSP_TRC_SRGB:
-                use_srgb = true;
+                GLSL(color.rgb = mix(color.rgb * vec3(12.92),
+                                     vec3(1.055) * pow(color.rgb,
+                                                       vec3(1.0/2.4))
+                                         - vec3(0.055),
+                                     lessThanEqual(vec3(0.0031308), color.rgb));)
                 break;
             case MP_CSP_TRC_BT_1886:
                 GLSL(color.rgb = pow(color.rgb, vec3(1.0/1.961));)
                 break;
-            case MP_CSP_TRC_LINEAR:
-                // Pick something arbitrary most likely bound to look good
+            case MP_CSP_TRC_GAMMA22:
                 GLSL(color.rgb = pow(color.rgb, vec3(1.0/2.2));)
                 break;
         }
-    }
-
-    GLSLF("// color management\n");
-    // TODO: cms
-
-    // temp hack to test stuff
-    if (use_srgb) {
-        GLSL(color.rgb = mix(color.rgb * vec3(12.92),
-                             vec3(1.055) * pow(color.rgb, vec3(1.0/2.4)) - vec3(0.055),
-                             lessThanEqual(vec3(0.0031308), color.rgb));)
     }
 }
 
@@ -1644,26 +1680,30 @@ static void check_gl_features(struct gl_video *p)
         disabled[n_disabled++] = "dithering (GLES unsupported)";
     }
 
-    int use_cms = p->opts.srgb || p->use_lut_3d;
+    int use_cms = p->opts.target_prim != MP_CSP_PRIM_AUTO ||
+                  p->opts.target_trc != MP_CSP_TRC_AUTO || p->use_lut_3d;
 
-    // srgb_compand() not available
-    if (!have_mix && p->opts.srgb) {
-        p->opts.srgb = false;
-        disabled[n_disabled++] = "sRGB output (GLSL version)";
+    // mix() is needed for some gamma functions
+    if (!have_mix && (p->opts.linear_scaling || p->opts.sigmoid_upscaling)) {
+        p->opts.linear_scaling = false;
+        p->opts.sigmoid_upscaling = false;
+        disabled[n_disabled++] = "linear/sigmoid scaling (GLSL version)";
+    }
+    if (!have_mix && use_cms) {
+        p->opts.target_prim = MP_CSP_PRIM_AUTO;
+        p->opts.target_trc = MP_CSP_TRC_AUTO;
+        p->use_lut_3d = false;
+        disabled[n_disabled++] = "color management (GLSL version)";
     }
     if (use_cms && !test_fbo(p, &have_fbo)) {
-        p->opts.srgb = false;
+        p->opts.target_prim = MP_CSP_PRIM_AUTO;
+        p->opts.target_trc = MP_CSP_TRC_AUTO;
         p->use_lut_3d = false;
         disabled[n_disabled++] = "color management (FBO)";
     }
     if (p->opts.smoothmotion && !test_fbo(p, &have_fbo)) {
         p->opts.smoothmotion = false;
         disabled[n_disabled++] = "smoothmotion (FBO)";
-    }
-    // because of bt709_expand()
-    if (!have_mix && p->use_lut_3d) {
-        p->use_lut_3d = false;
-        disabled[n_disabled++] = "color management (GLSL version)";
     }
     if (gl->es && p->opts.pbo) {
         p->opts.pbo = 0;
