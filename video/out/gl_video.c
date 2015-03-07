@@ -937,14 +937,15 @@ static void pass_sample_separated_get_weights(struct gl_video *p,
         GLSL(vec4 c2 = texture(lut, vec2(0.75, fcoord));)
         GLSL(float weights[6] = float[](c1.r, c1.g, c1.b, c2.r, c2.g, c2.b);)
     } else {
-        GLSL(float weights[N];)
-        GLSL(for (int n = 0; n < N / 4; n++) {)
-        GLSL(   vec4 c = texture(lut, vec2(1.0 / (N / 2) + n / float(N / 4), fcoord));)
-        GLSL(   weights[n * 4 + 0] = c.r;)
-        GLSL(   weights[n * 4 + 1] = c.g;)
-        GLSL(   weights[n * 4 + 2] = c.b;)
-        GLSL(   weights[n * 4 + 3] = c.a;)
-        GLSL(})
+        GLSLF("float weights[%d];\n", N);
+        for (int n = 0; n < N / 4; n++) {
+            GLSLF("c = texture(lut, vec2(1.0 / %d + %d / float(%d), fcoord));\n",
+                    N / 2, n, N / 4);
+            GLSLF("weights[%d] = c.r;\n", n * 4 + 0);
+            GLSLF("weights[%d] = c.g;\n", n * 4 + 1);
+            GLSLF("weights[%d] = c.b;\n", n * 4 + 2);
+            GLSLF("weights[%d] = c.a;\n", n * 4 + 3);
+        }
     }
 }
 
@@ -954,25 +955,31 @@ static void pass_sample_separated_gen(struct gl_video *p, struct scaler *scaler,
                                       int d_x, int d_y)
 {
     int N = scaler->kernel->size;
+    bool use_ar = scaler->antiring > 0;
+    GLSL(vec4 color = vec4(0.0);)
+    GLSLF("{\n");
     GLSLF("vec2 dir = vec2(%d, %d);\n", d_x, d_y);
-    GLSLF("#define N %d\n", N);
-    GLSLF("#define ANTIRING %f\n", scaler->antiring);
     GLSL(vec2 pt = (vec2(1.0) / texture_size0) * dir;)
     GLSL(float fcoord = dot(fract(texcoord0 * texture_size0 - vec2(0.5)), dir);)
-    GLSL(vec2 base = texcoord0 - fcoord * pt - pt * vec2(N / 2 - 1);)
+    GLSLF("vec2 base = texcoord0 - fcoord * pt - pt * vec2(%d);\n", N / 2 - 1);
+    GLSL(vec4 c;)
+    if (use_ar) {
+        GLSL(vec4 hi = vec4(0.0);)
+        GLSL(vec4 lo = vec4(1.0);)
+    }
     pass_sample_separated_get_weights(p, scaler);
-    GLSL(vec4 color = vec4(0);)
-    GLSL(vec4 hi  = vec4(0);)
-    GLSL(vec4 lo  = vec4(1);)
-    GLSL(for (int n = 0; n < N; n++) {)
-    GLSL(   vec4 c = texture(texture0, base + pt * vec2(n));)
-    GLSL(   color += vec4(weights[n]) * c;)
-    GLSL(   if (n == N/2-1 || n == N/2) {)
-    GLSL(       lo = min(lo, c);)
-    GLSL(       hi = max(hi, c);)
-    GLSL(   })
-    GLSL(})
-    GLSL(color = mix(color, clamp(color, lo, hi), ANTIRING);)
+    GLSLF("// scaler samples\n");
+    for (int n = 0; n < N; n++) {
+        GLSLF("c = texture(texture0, base + pt * vec2(%d));\n", n);
+        GLSLF("color += vec4(weights[%d]) * c;\n", n);
+        if (use_ar && (n == N/2-1 || n == N/2)) {
+            GLSL(lo = min(lo, c);)
+            GLSL(hi = max(hi, c);)
+        }
+    }
+    if (use_ar)
+        GLSLF("color = mix(color, clamp(color, lo, hi), %f);\n", scaler->antiring);
+    GLSLF("}\n");
 }
 
 static void pass_sample_separated(struct gl_video *p, struct scaler *scaler,
@@ -984,6 +991,57 @@ static void pass_sample_separated(struct gl_video *p, struct scaler *scaler,
     finish_pass_fbo(p, &scaler->sep_fbo, src_w, h, 0);
     GLSLF("// pass 2\n");
     pass_sample_separated_gen(p, scaler, 1, 0);
+}
+
+static void pass_sample_polar(struct gl_video *p, struct scaler *scaler)
+{
+    double radius = scaler->kernel->radius;
+    int bound = (int)ceil(radius);
+    bool use_ar = scaler->antiring > 0;
+    GLSL(vec4 color = vec4(0.0);)
+    GLSLF("{\n");
+    GLSL(vec2 pt = vec2(1.0) / texture_size0;)
+    GLSL(vec2 fcoord = fract(texcoord0 * texture_size0 - vec2(0.5));)
+    GLSL(vec2 base = texcoord0 - fcoord * pt;)
+    GLSL(vec4 c;)
+    GLSLF("float w, d, wsum = 0.0;\n");
+    if (use_ar) {
+        GLSL(vec4 lo = vec4(1.0);)
+        GLSL(vec4 hi = vec4(0.0);)
+    }
+    gl_sc_uniform_sampler(p->sc, "lut", scaler->gl_target,
+                          TEXUNIT_SCALERS + scaler->index);
+    GLSLF("// scaler samples\n");
+    for (int y = 1-bound; y <= bound; y++) {
+        for (int x = 1-bound; x <= bound; x++) {
+            // Since we can't know the subpixel position in advance, assume a
+            // worst case scenario
+            int yy = y > 0 ? y-1 : y;
+            int xx = x > 0 ? x-1 : x;
+            double dmax = sqrt(xx*xx + yy*yy);
+            // Skip samples definitely outside the radius
+            if (dmax >= radius)
+                continue;
+            GLSLF("d = length(vec2(%d, %d) - fcoord)/%f;\n", x, y, radius);
+            // Check for samples that might be skippable
+            if (dmax >= radius - 1)
+                GLSLF("if (d < 1.0) {\n");
+            GLSL(w = texture1D(lut, d).r;)
+            GLSL(wsum += w;)
+            GLSLF("c = texture(texture0, base + pt * vec2(%d, %d));\n", x, y);
+            GLSL(color += vec4(w) * c;)
+            if (use_ar && x >= 0 && y >= 0 && x <= 1 && y <= 1) {
+                GLSL(lo = min(lo, c);)
+                GLSL(hi = max(hi, c);)
+            }
+            if (dmax >= radius -1)
+                GLSLF("}\n");
+        }
+    }
+    GLSL(color = color / vec4(wsum);)
+    if (use_ar)
+        GLSLF("color = mix(color, clamp(color, lo, hi), %f);\n", scaler->antiring);
+    GLSLF("}\n");
 }
 
 // Scale. This uses the p->pass_tex[0] texture as source. It's hardcoded to
@@ -1004,10 +1062,16 @@ static void pass_scale(struct gl_video *p, int scaler_unit, const char *name,
     // Dispatch the scaler. They're all wildly different.
     if (strcmp(scaler->name, "bilinear") == 0) {
         GLSL(vec4 color = texture(texture0, texcoord0);)
-    } else if (scaler->kernel && !scaler->kernel->polar) {
+    } else if (scaler->kernel && scaler->kernel->polar) {
+        pass_sample_polar(p, scaler);
+    } else if (scaler->kernel) {
         pass_sample_separated(p, scaler, w, h);
     } else {
-        abort(); //not implemented yet
+        // stuff like sharpen, bicubic_fast etc. are still unimplemented
+        // but in this case we should pretty much always panic because it
+        // means something went wrong. XXX: better error message, perhaps
+        // a fallback to bilinear
+        abort();
     }
 }
 
