@@ -41,11 +41,6 @@
 #include "bitmap_packer.h"
 #include "dither.h"
 
-static const char vo_opengl_shaders[] =
-// Generated from gl_video_shaders.glsl
-#include "video/out/gl_video_shaders.h"
-;
-
 // Pixel width of 1D lookup textures.
 #define LOOKUP_TEXTURE_SIZE 256
 
