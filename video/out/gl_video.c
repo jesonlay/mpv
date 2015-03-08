@@ -876,6 +876,9 @@ static void reinit_scaler(struct gl_video *p, int scaler_unit, const char *name,
     scaler->insufficient = false;
     scaler->initialized = true;
 
+    for (int n = 0; n < 2; n++)
+        scaler->params[n] = p->opts.scaler_params[scaler->index][n];
+
     const struct filter_kernel *t_kernel = mp_find_filter_kernel(scaler->name);
     if (!t_kernel)
         return;
@@ -884,8 +887,8 @@ static void reinit_scaler(struct gl_video *p, int scaler_unit, const char *name,
     scaler->kernel = &scaler->kernel_storage;
 
     for (int n = 0; n < 2; n++) {
-        if (!isnan(p->opts.scaler_params[scaler->index][n]))
-            scaler->kernel->params[n] = p->opts.scaler_params[scaler->index][n];
+        if (!isnan(scaler->params[n]))
+            scaler->kernel->params[n] = scaler->params[n];
     }
 
     scaler->antiring = p->opts.scaler_antiring[scaler->index];
@@ -1069,6 +1072,86 @@ static void pass_sample_polar(struct gl_video *p, struct scaler *scaler)
     GLSLF("}\n");
 }
 
+static void bicubic_calcweights(struct gl_video *p, const char *t, const char *s)
+{
+    // Explanation of how bicubic scaling with only 4 texel fetches is done:
+    //   http://www.mate.tue.nl/mate/pdfs/10318.pdf
+    //   'Efficient GPU-Based Texture Interpolation using Uniform B-Splines'
+    // Explanation why this algorithm normally always blurs, even with unit
+    // scaling:
+    //   http://bigwww.epfl.ch/preprints/ruijters1001p.pdf
+    //   'GPU Prefilter for Accurate Cubic B-spline Interpolation'
+    GLSLF("vec4 %s = vec4(-0.5, 0.1666, 0.3333, -0.3333) * %s"
+                " + vec4(1, 0, -0.5, 0.5);\n", t, s);
+    GLSLF("%s = %s * %s + vec4(0, 0, -0.5, 0.5);\n", t, t, s);
+    GLSLF("%s = %s * %s + vec4(-0.6666, 0, 0.8333, 0.1666);\n", t, t, s);
+    GLSLF("%s.xy *= vec2(1, 1) / vec2(%s.z, %s.w);\n", t, t, t);
+    GLSLF("%s.xy += vec2(1 + %s, 1 - %s);\n", t, s, s);
+}
+
+static void pass_sample_bicubic_fast(struct gl_video *p)
+{
+    GLSL(vec4 color;)
+    GLSLF("{\n");
+    GLSL(vec2 pt = 1.0 / texture_size0;)
+    GLSL(vec2 fcoord = fract(texcoord0 * texture_size0 + vec2(0.5, 0.5));)
+    bicubic_calcweights(p, "parmx", "fcoord.x");
+    bicubic_calcweights(p, "parmy", "fcoord.y");
+    GLSL(vec4 cdelta;)
+    GLSL(cdelta.xz = parmx.RG * vec2(-pt.x, pt.x);)
+    GLSL(cdelta.yw = parmy.RG * vec2(-pt.y, pt.y);)
+    // first y-interpolation
+    GLSL(vec4 ar = texture(texture0, texcoord0 + cdelta.xy);)
+    GLSL(vec4 ag = texture(texture0, texcoord0 + cdelta.xw);)
+    GLSL(vec4 ab = mix(ag, ar, parmy.b);)
+    // second y-interpolation
+    GLSL(vec4 br = texture(texture0, texcoord0 + cdelta.zy);)
+    GLSL(vec4 bg = texture(texture0, texcoord0 + cdelta.zw);)
+    GLSL(vec4 aa = mix(bg, br, parmy.b);)
+    // x-interpolation
+    GLSL(color = mix(aa, ab, parmx.b);)
+    GLSLF("}\n");
+}
+
+static void pass_sample_sharpen3(struct gl_video *p, struct scaler *scaler)
+{
+    GLSL(vec4 color;)
+    GLSLF("{\n");
+    GLSL(vec2 pt = 1.0 / texture_size0;)
+    GLSL(vec2 st = pt * 0.5;)
+    GLSL(vec4 p = texture(texture0, texcoord0);)
+    GLSL(vec4 sum = texture(texture0, texcoord0 + st * vec2(+1, +1))
+                  + texture(texture0, texcoord0 + st * vec2(+1, -1))
+                  + texture(texture0, texcoord0 + st * vec2(-1, +1))
+                  + texture(texture0, texcoord0 + st * vec2(-1, -1));)
+    double param = isnan(scaler->params[0]) ? 0.5 : scaler->params[0];
+    GLSLF("color = p + (p - 0.25 * sum) * %f;\n", param);
+    GLSLF("}\n");
+}
+
+static void pass_sample_sharpen5(struct gl_video *p, struct scaler *scaler)
+{
+    GLSL(vec4 color;)
+    GLSLF("{\n");
+    GLSL(vec2 pt = 1.0 / texture_size0;)
+    GLSL(vec2 st1 = pt * 1.2;)
+    GLSL(vec4 p = texture(texture0, texcoord0);)
+    GLSL(vec4 sum1 = texture(texture0, texcoord0 + st1 * vec2(+1, +1))
+                   + texture(texture0, texcoord0 + st1 * vec2(+1, -1))
+                   + texture(texture0, texcoord0 + st1 * vec2(-1, +1))
+                   + texture(texture0, texcoord0 + st1 * vec2(-1, -1));)
+    GLSL(vec2 st2 = pt * 1.5;)
+    GLSL(vec4 sum2 = texture(texture0, texcoord0 + st2 * vec2(+1,  0))
+                   + texture(texture0, texcoord0 + st2 * vec2( 0, +1))
+                   + texture(texture0, texcoord0 + st2 * vec2(-1,  0))
+                   + texture(texture0, texcoord0 + st2 * vec2( 0, -1));)
+    GLSL(vec4 t = p * 0.859375 + sum2 * -0.1171875 + sum1 * -0.09765625;)
+    double param = isnan(scaler->params[0]) ? 0.5 : scaler->params[0];
+    GLSLF("color = p + t * %f;\n", param);
+    GLSLF("}\n");
+
+}
+
 // Scale. This uses the p->pass_tex[0] texture as source. It's hardcoded to
 // use all variables and values associated with p->pass_tex[0] (which includes
 // texture0/texcoord0/texture_size0).
@@ -1087,15 +1170,18 @@ static void pass_scale(struct gl_video *p, int scaler_unit, const char *name,
     // Dispatch the scaler. They're all wildly different.
     if (strcmp(scaler->name, "bilinear") == 0) {
         GLSL(vec4 color = texture(texture0, texcoord0);)
+    } else if (strcmp(scaler->name, "bicubic_fast") == 0) {
+        pass_sample_bicubic_fast(p);
+    } else if (strcmp(scaler->name, "sharpen3") == 0) {
+        pass_sample_sharpen3(p, scaler);
+    } else if (strcmp(scaler->name, "sharpen5") == 0) {
+        pass_sample_sharpen5(p, scaler);
     } else if (scaler->kernel && scaler->kernel->polar) {
         pass_sample_polar(p, scaler);
     } else if (scaler->kernel) {
         pass_sample_separated(p, scaler, w, h);
     } else {
-        // stuff like sharpen, bicubic_fast etc. are still unimplemented
-        // but in this case we should pretty much always panic because it
-        // means something went wrong. XXX: better error message, perhaps
-        // a fallback to bilinear
+        // Should never happen
         abort();
     }
 }

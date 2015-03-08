@@ -352,6 +352,10 @@ Available video output drivers are:
             blurrier. Defaults to 1. Note that setting this too low (eg. 0.5)
             leads to bad results. It's recommended to stay between 0.9 and 1.1.
 
+        ``sharpen3``, ``sharpen5``
+            Sharpening strength. Increasing this makes the image sharper but
+            adds more ringing and aliasing. Defaults to 0.5.
+
     ``scale-radius=<r>``
         Set radius for filters listed below, must be a float number between 1.0
         and 16.0. Defaults to be 3.0 if not specified.
