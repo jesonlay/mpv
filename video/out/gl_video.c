@@ -1201,54 +1201,51 @@ static void pass_read_video(struct gl_video *p, bool *use_indirect)
 {
     pass_set_image_textures(p, &p->image);
 
-    if (p->plane_count > 1) {
+    if (p->plane_count == 1) {
+        GLSL(vec4 color = texture(texture0, texcoord0);)
+        return;
+    }
+
+    // Move chroma1 to texture0 because the scalers are hard-coded for it
+    struct src_tex luma = p->pass_tex[0];
+    p->pass_tex[0] = p->pass_tex[1];
+
+    const char *cscale = p->opts.scalers[1];
+    if (input_is_subsampled(p) && strcmp(cscale, "bilinear") != 0) {
+        if (p->plane_count > 2) {
+            // For simplicity and performance, we merge the chroma planes
+            // into a single texture before scaling, so the scaler doesn't
+            // need to run multiple times.
+            GLSLF("// chroma merging\n");
+            GLSL(vec4 color = vec4(texture(texture0, texcoord0).r,
+                                   texture(texture2, texcoord2).r,
+                                   0.0, 1.0);)
+            int c_w = p->pass_tex[0].src.x1 - p->pass_tex[0].src.x0;
+            int c_h = p->pass_tex[0].src.y1 - p->pass_tex[0].src.y0;
+            assert(c_w == p->pass_tex[2].src.x1 - p->pass_tex[2].src.x0);
+            assert(c_h == p->pass_tex[2].src.y1 - p->pass_tex[2].src.y0);
+            finish_pass_fbo(p, &p->chroma_merge_fbo, c_w, c_h, 0);
+        }
+        GLSLF("// chroma scaling\n");
+        pass_scale(p, 1, cscale, 1.0, p->image_w, p->image_h);
+        GLSL(vec2 chroma = color.rg;)
+        // Always force rendering to a FBO before main scaling, or we would
+        // scale chroma incorrectly.
+        *use_indirect = true;
+    } else {
+        GLSL(vec4 color;)
         if (p->plane_count == 2) {
-            GLSL(vec2 chroma = texture(texture1, texcoord1).RG;) // NV formats
+            GLSL(vec2 chroma = texture(texture0, texcoord0).rg;) // NV formats
         } else {
-            GLSL(vec2 chroma = vec2(texture(texture1, texcoord1).r,
+            GLSL(vec2 chroma = vec2(texture(texture0, texcoord0).r,
                                     texture(texture2, texcoord2).r);)
         }
-
-        const char *cscale = p->opts.scalers[1];
-        if (input_is_subsampled(p) && strcmp(cscale, "bilinear") != 0) {
-            GLSLF("// chroma merging\n");
-            GLSL(vec4 color = vec4(chroma.r, chroma.g, 0.0, 0.0);)
-            if (1) { //p->plane_count > 2) {
-                // For simplicity - and maybe also for performance - we merge
-                // the chroma planes into one texture before scaling. So the
-                // scaler doesn't need to deal with more than 1 source texture.
-                int c_w = p->pass_tex[1].src.x1 - p->pass_tex[1].src.x0;
-                int c_h = p->pass_tex[1].src.y1 - p->pass_tex[1].src.y0;
-                finish_pass_fbo(p, &p->chroma_merge_fbo, c_w, c_h, 0);
-            }
-            GLSLF("// chroma scaling\n");
-            pass_scale(p, 1, cscale, 1.0, p->image_w, p->image_h);
-            GLSL(vec2 chroma = color.rg;)
-            // Always force rendering to a FBO before main scaling, or we would
-            // scale chroma incorrectly.
-            *use_indirect = true;
-
-            // What we'd really like to do is putting the output of the chroma
-            // scaler on texture unit 1, and leave luma on unit 0 (alpha on 3).
-            // But this obviously doesn't work, so here's an extremely shitty
-            // hack. Keep in mind that the shader already uses tex unit 0, so
-            // it can't be changed. alpha is missing too.
-            struct src_tex prev = p->pass_tex[0];
-            pass_set_image_textures(p, &p->image);
-            p->pass_tex[1] = p->pass_tex[0];
-            p->pass_tex[0] = prev;
-            GLSL(color = vec4(texture(texture1, texcoord1).r, chroma, 0);)
-        } else {
-            GLSL(vec4 color = vec4(0.0, chroma, 0.0);)
-            // These always use bilinear; either because the scaler is bilinear,
-            // or because we use an indirect pass.
-            GLSL(color.r = texture(texture0, texcoord0).r;)
-            if (p->has_alpha && p->plane_count >= 4)
-                GLSL(color.a = texture(texture3, texcoord3).r;)
-        }
-    } else {
-        GLSL(vec4 color = texture(texture0, texcoord0);)
     }
+
+    p->pass_tex[1] = luma; // ensure luma is still there
+    GLSL(color = vec4(texture(texture1, texcoord1).r, chroma, 1.0);)
+    if (p->has_alpha && p->plane_count >= 4)
+        GLSL(color.a = texture(texture3, texcoord3).r;)
 }
 
 // yuv conversion, and any other conversions before main up/down-scaling
