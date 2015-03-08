@@ -1371,7 +1371,13 @@ static void pass_render_main(struct gl_video *p, bool use_indirect)
         GLSL(color.rgb = cms_matrix * color.rgb;)
     }
 
-    // TODO: 3dlut
+    if (p->use_lut_3d) {
+        gl_sc_uniform_sampler(p->sc, "lut_3d", GL_TEXTURE_3D, TEXUNIT_3DLUT);
+        // For the 3DLUT we are arbitrarily using 2.4 as input gamma to reduce
+        // the severity of quantization errors.
+        GLSL(color.rgb = pow(color.rgb, vec3(1.0/2.4));)
+        GLSL(color.rgb = texture3D(lut_3d, color.rgb).rgb;)
+    }
 
     // Don't perform any gamut mapping unless linear light input is present to
     // begin with
