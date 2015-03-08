@@ -131,7 +131,9 @@ struct src_tex {
     GLuint gl_tex;
     GLenum gl_target;
     int tex_w, tex_h;
-    struct mp_rect src;
+    struct {
+        float x0, y0, x1, y1;
+    } src;
 };
 
 struct gl_video {
@@ -585,13 +587,13 @@ static void pass_load_fbotex(struct gl_video *p, struct fbotex *src_fbo, int id,
     };
 }
 
-static void pass_set_image_textures(struct gl_video *p, struct video_image *vimg)
+static void pass_set_image_textures(struct gl_video *p, struct video_image *vimg,
+                                    float chroma_offset[2])
 {
     GLuint imgtex[4] = {0};
 
     assert(vimg->mpi);
 
-    float offset[2] = {0};
     int chroma_loc = p->opts.chroma_location;
     if (!chroma_loc)
         chroma_loc = p->image_params.chroma_location;
@@ -606,8 +608,8 @@ static void pass_set_image_textures(struct gl_video *p, struct video_image *vimg
         float ls_w = 1.0 / (1 << p->image_desc.chroma_xs);
         float ls_h = 1.0 / (1 << p->image_desc.chroma_ys);
         // move chroma center to luma center (in chroma coord. space)
-        offset[0] = ls_w < 1 ? ls_w * -cx / 2 : 0;
-        offset[1] = ls_h < 1 ? ls_h * -cy / 2 : 0;
+        chroma_offset[0] = ls_w < 1 ? ls_w * -cx / 2 : 0;
+        chroma_offset[1] = ls_h < 1 ? ls_h * -cy / 2 : 0;
     }
 
     if (p->hwdec_active) {
@@ -630,6 +632,7 @@ static void pass_set_image_textures(struct gl_video *p, struct video_image *vimg
                 // from indirect_fbo, but not when rendering to indirect_fbo
                 // also, this should apply offset, and take care of odd video
                 // dimensions properly; and it should use floats instead
+                // note: offset is handled elsewhere now
                 .x0 = p->src_rect.x0 >> p->image_desc.xs[n],
                 .y0 = p->src_rect.y0 >> p->image_desc.ys[n],
                 .x1 = p->src_rect.x1 >> p->image_desc.xs[n],
@@ -1009,13 +1012,17 @@ static void pass_sample_separated_gen(struct gl_video *p, struct scaler *scaler,
 }
 
 static void pass_sample_separated(struct gl_video *p, struct scaler *scaler,
-                                  int w, int h)
+                                  int w, int h, float offset[2])
 {
     GLSLF("// pass 1\n");
+    p->pass_tex[0].src.y0 += offset[1];
+    p->pass_tex[0].src.y1 += offset[1];
     pass_sample_separated_gen(p, scaler, 0, 1);
     int src_w = p->pass_tex[0].src.x1 - p->pass_tex[0].src.x0;
     finish_pass_fbo(p, &scaler->sep_fbo, src_w, h, 0);
     GLSLF("// pass 2\n");
+    p->pass_tex[0].src.x0 += offset[0];
+    p->pass_tex[0].src.x1 += offset[0];
     pass_sample_separated_gen(p, scaler, 1, 0);
 }
 
@@ -1153,17 +1160,25 @@ static void pass_sample_sharpen5(struct gl_video *p, struct scaler *scaler)
 // Scale. This uses the p->pass_tex[0] texture as source. It's hardcoded to
 // use all variables and values associated with p->pass_tex[0] (which includes
 // texture0/texcoord0/texture_size0).
-// The src rectangle is implicit in p->pass_tex.
+// The src rectangle is implicit in p->pass_tex + offset.
 // The dst rectangle is implicit by what the caller will do next, but w and h
 // must still be what is going to be used (to dimension FBOs correctly).
 // This will declare "vec4 color;", which contains the scaled contents.
 // The scaler unit is initialized by this function; in order to avoid cache
 // thrashing, the scaler unit should usually use the same parameters.
 static void pass_scale(struct gl_video *p, int scaler_unit, const char *name,
-                       double scale_factor, int w, int h)
+                       double scale_factor, int w, int h, float offset[2])
 {
     struct scaler *scaler = &p->scalers[scaler_unit];
     reinit_scaler(p, scaler_unit, name, scale_factor);
+
+    // Set up the offsets for everything other than separated scaling
+    if (!scaler->kernel || scaler->kernel->polar) {
+        p->pass_tex[0].src.x0 += offset[0];
+        p->pass_tex[0].src.x1 += offset[0];
+        p->pass_tex[0].src.y0 += offset[1];
+        p->pass_tex[0].src.y1 += offset[1];
+    }
 
     // Dispatch the scaler. They're all wildly different.
     if (strcmp(scaler->name, "bilinear") == 0) {
@@ -1177,7 +1192,7 @@ static void pass_scale(struct gl_video *p, int scaler_unit, const char *name,
     } else if (scaler->kernel && scaler->kernel->polar) {
         pass_sample_polar(p, scaler);
     } else if (scaler->kernel) {
-        pass_sample_separated(p, scaler, w, h);
+        pass_sample_separated(p, scaler, w, h, offset);
     } else {
         // Should never happen
         abort();
@@ -1197,7 +1212,8 @@ static bool input_is_subsampled(struct gl_video *p)
 // (not sure how exactly this should involve the resamplers)
 static void pass_read_video(struct gl_video *p)
 {
-    pass_set_image_textures(p, &p->image);
+    float offset[2] = {0};
+    pass_set_image_textures(p, &p->image, offset);
 
     if (p->plane_count == 1) {
         GLSL(vec4 color = texture(texture0, texcoord0);)
@@ -1225,12 +1241,18 @@ static void pass_read_video(struct gl_video *p)
             finish_pass_fbo(p, &p->chroma_merge_fbo, c_w, c_h, 0);
         }
         GLSLF("// chroma scaling\n");
-        pass_scale(p, 1, cscale, 1.0, p->image_w, p->image_h);
+        pass_scale(p, 1, cscale, 1.0, p->image_w, p->image_h, offset);
         GLSL(vec2 chroma = color.rg;)
         // Always force rendering to a FBO before main scaling, or we would
         // scale chroma incorrectly.
         p->use_indirect = true;
     } else {
+        // Set the offset manually for the implicit case
+        p->pass_tex[0].src.x0 += offset[0];
+        p->pass_tex[0].src.x1 += offset[0];
+        p->pass_tex[0].src.y0 += offset[1];
+        p->pass_tex[0].src.y1 += offset[1];
+
         GLSL(vec4 color;)
         if (p->plane_count == 2) {
             GLSL(vec2 chroma = texture(texture0, texcoord0).rg;) // NV formats
@@ -1240,7 +1262,7 @@ static void pass_read_video(struct gl_video *p)
         }
     }
 
-    p->pass_tex[1] = luma; // ensure luma is still there
+    p->pass_tex[1] = luma;
     GLSL(color = vec4(texture(texture1, texcoord1).r, chroma, 1.0);)
     if (p->has_alpha && p->plane_count >= 4)
         GLSL(color.a = texture(texture3, texcoord3).r;)
@@ -1415,7 +1437,7 @@ static void pass_render_main(struct gl_video *p)
 
         int w = p->dst_rect.x1 - p->dst_rect.x0;
         int h = p->dst_rect.y1 - p->dst_rect.y0;
-        pass_scale(p, 0, scaler, scale_factor, w, h);
+        pass_scale(p, 0, scaler, scale_factor, w, h, (float[]){0, 0});
     }
 
     GLSLF("// scaler post-conversion\n");
