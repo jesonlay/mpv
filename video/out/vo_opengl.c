@@ -315,7 +315,7 @@ static bool reparse_cmdline(struct gl_priv *p, char *args)
     if (r >= 0) {
         mpgl_lock(p->glctx);
         gl_video_set_options(p->renderer, opts->renderer_opts);
-        vo_set_flip_queue_params(p->vo, 0, opts->renderer_opts->smoothmotion);
+        vo_set_flip_queue_params(p->vo, 100000, opts->renderer_opts->smoothmotion);
         p->vo->want_redraw = true;
         mpgl_unlock(p->glctx);
     }
@@ -459,7 +459,7 @@ static int preinit(struct vo *vo)
     gl_video_set_output_depth(p->renderer, p->glctx->depth_r, p->glctx->depth_g,
                               p->glctx->depth_b);
     gl_video_set_options(p->renderer, p->renderer_opts);
-    vo_set_flip_queue_params(vo, 0, p->renderer_opts->smoothmotion);
+    vo_set_flip_queue_params(vo, 100000, p->renderer_opts->smoothmotion);
 
     p->cms = gl_lcms_init(p, vo->log, vo->global);
     if (!p->cms)

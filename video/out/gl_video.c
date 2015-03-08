@@ -123,10 +123,9 @@ struct scaler {
 struct fbosurface {
     struct fbotex fbotex;
     int64_t pts;
-    bool valid;
 };
 
-#define FBOSURFACES_MAX 2
+#define FBOSURFACES_MAX 8
 
 struct src_tex {
     GLuint gl_tex;
@@ -181,6 +180,7 @@ struct gl_video {
     struct fbotex chroma_merge_fbo;
     struct fbosurface surfaces[FBOSURFACES_MAX];
     size_t surface_idx;
+    size_t surface_now;
 
     // state for luma (0) and chroma (1) scalers
     struct scaler scalers[2];
@@ -489,6 +489,18 @@ void gl_video_set_debug(struct gl_video *p, bool enable)
         gl_set_debug_logger(gl, enable ? p->log : NULL);
 }
 
+static void gl_video_reset_surfaces(struct gl_video *p)
+{
+    for (int i = 0; i < FBOSURFACES_MAX; i++)
+        p->surfaces[i].pts = 0;
+    p->surface_idx = 0;
+    p->surface_now = 0;
+}
+
+static size_t fbosurface_next(size_t id) {
+    return (id+1) % FBOSURFACES_MAX;
+}
+
 static void recreate_osd(struct gl_video *p)
 {
     if (p->osd)
@@ -522,6 +534,8 @@ static void uninit_rendering(struct gl_video *p)
 
     gl->DeleteTextures(1, &p->dither_texture);
     p->dither_texture = 0;
+
+    gl_video_reset_surfaces(p);
 }
 
 void gl_video_set_lut3d(struct gl_video *p, struct lut3d *lut3d)
@@ -559,6 +573,18 @@ void gl_video_set_lut3d(struct gl_video *p, struct lut3d *lut3d)
     debug_check_gl(p, "after 3d lut creation");
 
     reinit_rendering(p);
+}
+
+static void pass_load_fbotex(struct gl_video *p, struct fbotex *src_fbo, int id,
+                             int w, int h)
+{
+    p->pass_tex[id] = (struct src_tex){
+        .gl_tex = src_fbo->texture,
+        .gl_target = GL_TEXTURE_2D,
+        .tex_w = src_fbo->tex_w,
+        .tex_h = src_fbo->tex_h,
+        .src = {0, 0, w, h},
+    };
 }
 
 static void pass_set_image_textures(struct gl_video *p, struct video_image *vimg)
@@ -818,13 +844,7 @@ static void finish_pass_fbo(struct gl_video *p, struct fbotex *dst_fbo,
 
     finish_pass_direct(p, dst_fbo->fbo, dst_fbo->tex_w, dst_fbo->tex_h,
                        &(struct mp_rect){0, 0, w, h});
-    p->pass_tex[0] = (struct src_tex){
-        .gl_tex = dst_fbo->texture,
-        .gl_target = GL_TEXTURE_2D,
-        .tex_w = dst_fbo->tex_w,
-        .tex_h = dst_fbo->tex_h,
-        .src = {0, 0, w, h},
-    };
+    pass_load_fbotex(p, dst_fbo, 0, w, h);
 }
 
 static void uninit_scaler(struct gl_video *p, int scaler_unit)
@@ -1239,7 +1259,9 @@ static void get_scale_factors(struct gl_video *p, double xy[2])
             (double)(p->src_rect.y1 - p->src_rect.y0);
 }
 
-static void pass_scale_main(struct gl_video *p, bool use_indirect)
+// Takes care of the main scaling and post-conversions such as gamut/gamma
+// mapping or color management.
+static void pass_render_main(struct gl_video *p, bool use_indirect)
 {
     // Figure out the main scaler.
     double xy[2];
@@ -1473,10 +1495,85 @@ static void pass_dither(struct gl_video *p)
                        dither_quantization;)
 }
 
-static void pass_video_to_screen(struct gl_video *p, int fbo)
+// The main rendering function, takes care of everything up to and including
+// color management
+static void pass_draw_frame(struct gl_video *p)
+{
+    bool indirect = false;
+    pass_read_video(p, &indirect);
+    pass_convert_yuv(p);
+    pass_render_main(p, indirect);
+}
+
+static void pass_draw_to_screen(struct gl_video *p, int fbo)
 {
     pass_dither(p);
     finish_pass_direct(p, fbo, p->window.x1, -p->window.y1, &p->dst_rect);
+}
+
+// Draws an interpolate frame to fbo, based on the frame timing in t
+static void gl_video_interpolate_frame(struct gl_video *p, int fbo,
+                                       struct frame_timing *t)
+{
+    int vp_w = p->dst_rect.x1 - p->dst_rect.x0,
+        vp_h = p->dst_rect.y1 - p->dst_rect.y0,
+        fuzz = FBOTEX_FUZZY_W | FBOTEX_FUZZY_H;
+    size_t surface_nxt = fbosurface_next(p->surface_now);
+
+    // First of all, figure out if we have a frame availble at all, and draw
+    // it manually + reset the queue if not
+    if (!p->surfaces[p->surface_now].pts) {
+        pass_draw_frame(p);
+        finish_pass_fbo(p, &p->surfaces[p->surface_now].fbotex, vp_w, vp_h, fuzz);
+        p->surfaces[p->surface_now].pts = t ? t->pts : 0;
+        p->surface_idx = p->surface_now;
+    }
+
+    // Draw the right mix of frames to the screen.
+    pass_load_fbotex(p, &p->surfaces[p->surface_now].fbotex, 0, vp_w, vp_h);
+    if (!t || p->surfaces[surface_nxt].pts < p->surfaces[p->surface_now].pts) {
+        // No next frame available (eg. start of playback, after reconfigure
+        // or end of file, so just draw the current frame instead of blending.
+        // Also occurs when no timing information is available (eg. paused)
+        GLSL(vec4 color = texture(texture0, texcoord0);)
+        p->is_interpolated = false;
+    } else {
+        int64_t next_pts = p->surfaces[surface_nxt].pts,
+                vsync_interval = t->next_vsync - t->prev_vsync;
+        double inter_coeff = (double)(next_pts - t->next_vsync) / vsync_interval,
+               threshold = p->opts.smoothmotion_threshold;
+        inter_coeff = inter_coeff <= 0.0 + threshold ? 0.0 : inter_coeff;
+        inter_coeff = inter_coeff >= 1.0 - threshold ? 1.0 : inter_coeff;
+        inter_coeff = 1.0 - inter_coeff;
+        gl_sc_uniform_f(p->sc, "inter_coeff", inter_coeff);
+        p->is_interpolated = inter_coeff > 0;
+
+        MP_STATS(p, "frame-mix");
+        MP_DBG(p, "inter frame ppts: %lld, pts: %lld, vsync: %lld, mix: %f\n",
+               (long long)p->surfaces[p->surface_now].pts,
+               (long long)p->surfaces[surface_nxt].pts,
+               (long long)t->next_vsync, inter_coeff);
+
+        pass_load_fbotex(p, &p->surfaces[surface_nxt].fbotex, 1, vp_w, vp_h);
+        GLSL(vec4 color = mix(texture(texture0, texcoord0),
+                              texture(texture1, texcoord1),
+                              inter_coeff);)
+        // Dequeue the current frame if it's no longer needed
+        if (t->next_vsync + vsync_interval > p->surfaces[surface_nxt].pts)
+            p->surface_now = surface_nxt;
+    }
+    pass_draw_to_screen(p, fbo);
+
+    // Render a new frame if it came in and there's room in the queue
+    size_t surface_dst = fbosurface_next(p->surface_idx);
+    if (t && surface_dst != p->surface_now &&
+             p->surfaces[p->surface_idx].pts < t->pts) {
+        MP_STATS(p, "new-pts");
+        pass_draw_frame(p);
+        finish_pass_fbo(p, &p->surfaces[surface_dst].fbotex, vp_w, vp_h, fuzz);
+        p->surfaces[surface_dst].pts = t->pts;
+        p->surface_idx = surface_dst;
+    }
 }
 
 // (fbo==0 makes BindFramebuffer select the screen backbuffer)
@@ -1499,11 +1596,12 @@ void gl_video_render_frame(struct gl_video *p, int fbo, struct frame_timing *t)
 
     gl_sc_set_vao(p->sc, &p->vao);
 
-    bool indirect = false;
-    pass_read_video(p, &indirect);
-    pass_convert_yuv(p);
-    pass_scale_main(p, indirect);
-    pass_video_to_screen(p, fbo);
+    if (p->opts.smoothmotion) {
+        gl_video_interpolate_frame(p, fbo, t);
+    } else {
+        pass_draw_frame(p);
+        pass_draw_to_screen(p, fbo);
+    }
 
     p->frames_rendered++;
 
@@ -1526,6 +1624,8 @@ void gl_video_resize(struct gl_video *p, struct mp_rect *window,
     p->window = *window;
 
     p->vp_vflipped = vflip;
+
+    gl_video_reset_surfaces(p);
 }
 
 static bool get_image(struct gl_video *p, struct mp_image *mpi)
@@ -1805,9 +1905,7 @@ void gl_video_unset_gl_state(struct gl_video *p)
 
 void gl_video_reset(struct gl_video *p)
 {
-    for (int i = 0; i < FBOSURFACES_MAX; i++)
-        p->surfaces[i].pts = 0;
-    p->surface_idx = 0;
+    gl_video_reset_surfaces(p);
 }
 
 bool gl_video_showing_interpolated_frame(struct gl_video *p)
@@ -1976,7 +2074,7 @@ void gl_video_config(struct gl_video *p, struct mp_image_params *params)
             init_video(p);
     }
 
-    //check_resize(p);
+    gl_video_reset_surfaces(p);
 }
 
 void gl_video_set_output_depth(struct gl_video *p, int r, int g, int b)
