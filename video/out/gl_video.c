@@ -179,16 +179,14 @@ struct gl_video {
     struct fbotex indirect_fbo;         // RGB target
     struct fbotex chroma_merge_fbo;
     struct fbosurface surfaces[FBOSURFACES_MAX];
+    bool use_indirect;
+
     size_t surface_idx;
     size_t surface_now;
+    bool is_interpolated;
 
     // state for luma (0) and chroma (1) scalers
     struct scaler scalers[2];
-
-    // true if scaler is currently upscaling
-    bool upscaling;
-
-    bool is_interpolated;
 
     struct mp_csp_equalizer video_eq;
 
@@ -1197,7 +1195,7 @@ static bool input_is_subsampled(struct gl_video *p)
 
 // sample from video textures, set "color" variable to yuv value
 // (not sure how exactly this should involve the resamplers)
-static void pass_read_video(struct gl_video *p, bool *use_indirect)
+static void pass_read_video(struct gl_video *p)
 {
     pass_set_image_textures(p, &p->image);
 
@@ -1231,7 +1229,7 @@ static void pass_read_video(struct gl_video *p, bool *use_indirect)
         GLSL(vec2 chroma = color.rg;)
         // Always force rendering to a FBO before main scaling, or we would
         // scale chroma incorrectly.
-        *use_indirect = true;
+        p->use_indirect = true;
     } else {
         GLSL(vec4 color;)
         if (p->plane_count == 2) {
@@ -1295,6 +1293,7 @@ static void pass_convert_yuv(struct gl_video *p)
     }
 
     if (p->image_params.colorspace == MP_CSP_BT_2020_C) {
+        p->use_indirect = true;
         // Conversion for C'rcY'cC'bc via the BT.2020 CL system:
         // C'bc = (B'-Y'c) / 1.9404  | C'bc <= 0
         //      = (B'-Y'c) / 1.5816  | C'bc >  0
@@ -1329,6 +1328,7 @@ static void pass_convert_yuv(struct gl_video *p)
     GLSL(color.rgb = clamp(color.rgb, 0.0, 1.0);)
 
     if (p->user_gamma_enabled) {
+        p->use_indirect = true;
         gl_sc_uniform_f(sc, "user_gamma", user_gamma);
         GLSL(color.rgb = pow(color.rgb, vec3(1.0 / user_gamma));)
     }
@@ -1344,7 +1344,7 @@ static void get_scale_factors(struct gl_video *p, double xy[2])
 
 // Takes care of the main scaling and post-conversions such as gamut/gamma
 // mapping or color management.
-static void pass_render_main(struct gl_video *p, bool use_indirect)
+static void pass_render_main(struct gl_video *p)
 {
     // Figure out the main scaler.
     double xy[2];
@@ -1374,6 +1374,7 @@ static void pass_render_main(struct gl_video *p, bool use_indirect)
     bool use_linear = p->opts.linear_scaling || p->opts.sigmoid_upscaling
                       || use_cms || p->image_params.gamma == MP_CSP_TRC_LINEAR;
     if (use_linear) {
+        p->use_indirect = true;
         switch (p->image_params.gamma) {
             case MP_CSP_TRC_SRGB:
                 GLSL(color.rgb = mix(color.rgb / vec3(12.92),
@@ -1393,6 +1394,7 @@ static void pass_render_main(struct gl_video *p, bool use_indirect)
     bool use_sigmoid = use_linear && p->opts.sigmoid_upscaling && upscaling;
     float sig_center, sig_slope, sig_offset, sig_scale;
     if (use_sigmoid) {
+        p->use_indirect = true;
         // Coefficients for the sigmoidal transform are taken from the
         // formula here: http://www.imagemagick.org/Usage/color_mods/#sigmoidal
         sig_center = p->opts.sigmoid_center;
@@ -1406,7 +1408,7 @@ static void pass_render_main(struct gl_video *p, bool use_indirect)
     }
 
     GLSLF("// main scaling\n");
-    if (!use_indirect && strcmp(scaler, "bilinear") == 0) {
+    if (!p->use_indirect && strcmp(scaler, "bilinear") == 0) {
         // implicitly scale in pass_video_to_screen
     } else {
         finish_pass_fbo(p, &p->indirect_fbo, p->image_w, p->image_h, 0);
@@ -1458,6 +1460,7 @@ static void pass_render_main(struct gl_video *p, bool use_indirect)
         gl_sc_uniform_sampler(p->sc, "lut_3d", GL_TEXTURE_3D, TEXUNIT_3DLUT);
         // For the 3DLUT we are arbitrarily using 2.4 as input gamma to reduce
         // the severity of quantization errors.
+        GLSL(color.rgb = clamp(color.rgb, 0.0, 1.0);)
         GLSL(color.rgb = pow(color.rgb, vec3(1.0/2.4));)
         GLSL(color.rgb = texture3D(lut_3d, color.rgb).rgb;)
     }
@@ -1465,6 +1468,7 @@ static void pass_render_main(struct gl_video *p, bool use_indirect)
     // Don't perform any gamut mapping unless linear light input is present to
     // begin with
     if (use_linear) {
+        GLSL(color.rgb = clamp(color.rgb, 0.0, 1.0);)
         switch (trc_dst) {
             case MP_CSP_TRC_SRGB:
                 GLSL(color.rgb = mix(color.rgb * vec3(12.92),
@@ -1588,10 +1592,10 @@ static void pass_dither(struct gl_video *p)
 // color management
 static void pass_draw_frame(struct gl_video *p)
 {
-    bool indirect = false;
-    pass_read_video(p, &indirect);
+    p->use_indirect = false; // set to true as needed by pass_*
+    pass_read_video(p);
     pass_convert_yuv(p);
-    pass_render_main(p, indirect);
+    pass_render_main(p);
 }
 
 static void pass_draw_to_screen(struct gl_video *p, int fbo)
