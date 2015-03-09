@@ -66,6 +66,34 @@ static const struct gl_vao_entry vertex_vao[] = {
     {0}
 };
 
+struct mpgl_osd_part {
+    enum sub_bitmap_format format;
+    int bitmap_id, bitmap_pos_id;
+    GLuint texture;
+    int w, h;
+    GLuint buffer;
+    int num_subparts;
+    struct sub_bitmap *subparts;
+    struct vertex *vertices;
+    struct bitmap_packer *packer;
+};
+
+struct mpgl_osd {
+    struct mp_log *log;
+    struct osd_state *osd;
+    GL *gl;
+    bool use_pbo;
+    bool scaled;
+    struct mpgl_osd_part *parts[MAX_OSD_PARTS];
+    const struct osd_fmt_entry *fmt_table;
+    bool formats[SUBBITMAP_COUNT];
+    struct gl_vao vao;
+    // temporary
+    int stereo_mode;
+    int display_size[2];
+    void *scratch;
+};
+
 struct mpgl_osd *mpgl_osd_init(GL *gl, struct mp_log *log, struct osd_state *osd)
 {
     GLint max_texture_size;
@@ -121,6 +149,11 @@ void mpgl_osd_destroy(struct mpgl_osd *ctx)
             gl->DeleteBuffers(1, &p->buffer);
     }
     talloc_free(ctx);
+}
+
+void mpgl_osd_set_options(struct mpgl_osd *ctx, bool pbo)
+{
+    ctx->use_pbo = pbo;
 }
 
 static bool upload_pbo(struct mpgl_osd *ctx, struct mpgl_osd_part *osd,
@@ -363,6 +396,11 @@ enum sub_bitmap_format mpgl_osd_get_part_format(struct mpgl_osd *ctx, int index)
 {
     assert(index >= 0 && index < MAX_OSD_PARTS);
     return ctx->parts[index]->format;
+}
+
+struct gl_vao *mpgl_osd_get_vao(struct mpgl_osd *ctx)
+{
+    return &ctx->vao;
 }
 
 void mpgl_osd_generate(struct mpgl_osd *ctx, struct mp_osd_res res, double pts,

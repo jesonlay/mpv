@@ -506,7 +506,7 @@ static void recreate_osd(struct gl_video *p)
     if (p->osd)
         mpgl_osd_destroy(p->osd);
     p->osd = mpgl_osd_init(p->gl, p->log, p->osd_state);
-    p->osd->use_pbo = p->opts.pbo;
+    mpgl_osd_set_options(p->osd, p->opts.pbo);
 }
 
 static void reinit_rendering(struct gl_video *p)
@@ -1737,7 +1737,6 @@ draw_osd:
         enum sub_bitmap_format fmt = mpgl_osd_get_part_format(p->osd, n);
         if (!fmt)
             continue;
-        gl->BindTexture(GL_TEXTURE_2D, p->osd->parts[n]->texture);
         gl_sc_uniform_sampler(p->sc, "osdtex", GL_TEXTURE_2D, 0);
         switch (fmt) {
         case SUBBITMAP_RGBA: {
@@ -1754,7 +1753,7 @@ draw_osd:
         default:
             abort();
         }
-        gl_sc_set_vao(p->sc, &p->osd->vao);
+        gl_sc_set_vao(p->sc, mpgl_osd_get_vao(p->osd));
         gl_sc_gen_shader_and_reset(p->sc);
         mpgl_osd_draw_part(p->osd, p->window.x1, -p->window.y1, n);
     }
