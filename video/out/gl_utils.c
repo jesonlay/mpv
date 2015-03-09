@@ -846,7 +846,8 @@ void gl_sc_gen_shader_and_reset(struct gl_shader_cache *sc)
         }
     }
     if (!entry) {
-        assert(sc->num_entries < SC_ENTRIES); // just don't have too many
+        if (sc->num_entries == SC_ENTRIES)
+            sc_flush_cache(sc);
         entry = &sc->entries[sc->num_entries++];
         *entry = (struct sc_entry){.key = talloc_strdup(NULL, key)};
     }
