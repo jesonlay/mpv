@@ -784,12 +784,7 @@ static void render_pass_quad(struct gl_video *p, int vp_w, int vp_h,
     struct vertex va[4];
 
     float matrix[3][3];
-    int vp_y = 0;
-    if (vp_h < 0) {
-        vp_y = -vp_h;
-        vp_h = 0;
-    }
-    gl_matrix_ortho2d(matrix, 0, vp_w, vp_y, vp_h);
+    gl_matrix_ortho2d(matrix, 0, vp_w, 0, vp_h);
 
     float x[2] = {dst->x0, dst->x1};
     float y[2] = {dst->y0, dst->y1};

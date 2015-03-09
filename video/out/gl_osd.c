@@ -342,12 +342,6 @@ static void get_3d_side_by_side(int stereo_mode, int div[2])
 
 void mpgl_osd_draw_part(struct mpgl_osd *ctx, int vp_w, int vp_h, int index)
 {
-    int vp_y = 0;
-    if (vp_h < 0) {
-        vp_y = -vp_h;
-        vp_h = 0;
-    }
-
     int div[2];
     get_3d_side_by_side(ctx->stereo_mode, div);
 
@@ -355,7 +349,7 @@ void mpgl_osd_draw_part(struct mpgl_osd *ctx, int vp_w, int vp_h, int index)
         for (int y = 0; y < div[1]; y++) {
             float matrix[3][3];
 
-            gl_matrix_ortho2d(matrix, 0, vp_w, vp_y, vp_h);
+            gl_matrix_ortho2d(matrix, 0, vp_w, 0, vp_h);
 
             float a_x = ctx->display_size[0] * x;
             float a_y = ctx->display_size[1] * y;
