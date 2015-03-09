@@ -1197,6 +1197,10 @@ static void pass_scale(struct gl_video *p, int scaler_unit, const char *name,
         // Should never happen
         abort();
     }
+
+    // Micro-optimization: Avoid scaling unneeded channels
+    if (!p->has_alpha || p->opts.alpha_mode != 1)
+        GLSL(color.a = 1.0;)
 }
 
 // return false if RGB or 4:4:4 YUV
@@ -1217,7 +1221,7 @@ static void pass_read_video(struct gl_video *p)
 
     if (p->plane_count == 1) {
         GLSL(vec4 color = texture(texture0, texcoord0);)
-        return;
+        goto fixalpha;
     }
 
     // Move chroma1 to texture0 because the scalers are hard-coded for it
@@ -1264,8 +1268,16 @@ static void pass_read_video(struct gl_video *p)
 
     p->pass_tex[1] = luma;
     GLSL(color = vec4(texture(texture1, texcoord1).r, chroma, 1.0);)
-    if (p->has_alpha && p->plane_count >= 4)
-        GLSL(color.a = texture(texture3, texcoord3).r;)
+
+fixalpha:
+    if (p->has_alpha) {
+        if (p->plane_count >= 4)
+            GLSL(color.a = texture(texture3, texcoord3).r;)
+        if (p->opts.alpha_mode == 0) // none
+            GLSL(color.a = 1.0;)
+        if (p->opts.alpha_mode == 2) // blend
+            GLSL(color = vec4(color.rgb * color.a, 1.0);)
+    }
 }
 
 // yuv conversion, and any other conversions before main up/down-scaling
