@@ -505,8 +505,8 @@ static void recreate_osd(struct gl_video *p)
 {
     if (p->osd)
         mpgl_osd_destroy(p->osd);
-    //p->osd = mpgl_osd_init(p->gl, p->log, p->osd_state, p->osd_programs);
-    //p->osd->use_pbo = p->opts.pbo;
+    p->osd = mpgl_osd_init(p->gl, p->log, p->osd_state);
+    p->osd->use_pbo = p->opts.pbo;
 }
 
 static void reinit_rendering(struct gl_video *p)
@@ -1717,8 +1717,7 @@ void gl_video_render_frame(struct gl_video *p, int fbo, struct frame_timing *t)
 
     if (!vimg->mpi) {
         gl->Clear(GL_COLOR_BUFFER_BIT);
-        //goto draw_osd;
-        return;
+        goto draw_osd;
     }
 
     gl_sc_set_vao(p->sc, &p->vao);
@@ -1734,11 +1733,43 @@ void gl_video_render_frame(struct gl_video *p, int fbo, struct frame_timing *t)
 
     debug_check_gl(p, "after video rendering");
 
-    gl->UseProgram(0);
-    gl->BindFramebuffer(GL_FRAMEBUFFER, 0);
-
     if (p->hwdec_active)
         p->hwdec->driver->unmap_image(p->hwdec);
+
+draw_osd:
+
+    mpgl_osd_generate(p->osd, p->osd_rect, p->osd_pts, p->image_params.stereo_out);
+
+    for (int n = 0; n < MAX_OSD_PARTS; n++) {
+        enum sub_bitmap_format fmt = mpgl_osd_get_part_format(p->osd, n);
+        if (!fmt)
+            continue;
+        gl->BindTexture(GL_TEXTURE_2D, p->osd->parts[n]->texture);
+        gl_sc_uniform_sampler(p->sc, "osdtex", GL_TEXTURE_2D, 0);
+        switch (fmt) {
+        case SUBBITMAP_RGBA: {
+            GLSLF("// OSD (RGBA)\n");
+            GLSL(vec4 color = texture(osdtex, texcoord).bgra;)
+            break;
+        }
+        case SUBBITMAP_LIBASS: {
+            GLSLF("// OSD (libass)\n");
+            GLSL(vec4 color =
+                vec4(ass_color.rgb, ass_color.a * texture(osdtex, texcoord).r);)
+            break;
+        }
+        default:
+            abort();
+        }
+        gl_sc_set_vao(p->sc, &p->osd->vao);
+        gl_sc_gen_shader_and_reset(p->sc);
+        mpgl_osd_draw_part(p->osd, p->window.x1, -p->window.y1, n);
+    }
+
+    debug_check_gl(p, "after OSD rendering");
+
+    gl->UseProgram(0);
+    gl->BindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
 void gl_video_resize(struct gl_video *p, struct mp_rect *window,

@@ -13,8 +13,9 @@ struct mpgl_osd_part {
     GLuint texture;
     int w, h;
     GLuint buffer;
-    int num_vertices;
-    void *vertices;
+    int num_subparts;
+    struct sub_bitmap *subparts;
+    struct vertex *vertices;
     struct bitmap_packer *packer;
 };
 
@@ -28,17 +29,18 @@ struct mpgl_osd {
     const struct osd_fmt_entry *fmt_table;
     bool formats[SUBBITMAP_COUNT];
     struct gl_vao vao;
-    GLuint *programs; // SUBBITMAP_COUNT elements
     // temporary
-    float offset[2];
+    int stereo_mode;
+    int display_size[2];
     void *scratch;
 };
 
-struct mpgl_osd *mpgl_osd_init(GL *gl, struct mp_log *log, struct osd_state *osd,
-                               GLuint *programs);
+struct mpgl_osd *mpgl_osd_init(GL *gl, struct mp_log *log, struct osd_state *osd);
 void mpgl_osd_destroy(struct mpgl_osd *ctx);
 
-void mpgl_osd_draw(struct mpgl_osd *ctx, struct mp_osd_res res, double pts,
-                   int stereo_mode);
+void mpgl_osd_generate(struct mpgl_osd *ctx, struct mp_osd_res res, double pts,
+                       int stereo_mode);
+enum sub_bitmap_format mpgl_osd_get_part_format(struct mpgl_osd *ctx, int index);
+void mpgl_osd_draw_part(struct mpgl_osd *ctx, int vp_w, int vp_h, int index);
 
 #endif
