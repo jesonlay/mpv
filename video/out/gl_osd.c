@@ -267,16 +267,14 @@ static void write_quad(struct vertex *va, float matrix[3][3],
                        float tx0, float ty0, float tx1, float ty1,
                        float tex_w, float tex_h, const uint8_t color[4])
 {
-    float nx0 = x0 * matrix[0][0] + y0 * matrix[1][0] + matrix[2][0];
-    float ny0 = x0 * matrix[0][1] + y0 * matrix[1][1] + matrix[2][1];
-    float nx1 = x1 * matrix[0][0] + y1 * matrix[1][0] + matrix[2][0];
-    float ny1 = x1 * matrix[0][1] + y1 * matrix[1][1] + matrix[2][1];
+    gl_matrix_mul_vec(matrix, &x0, &y0);
+    gl_matrix_mul_vec(matrix, &x1, &y1);
 
 #define COLOR_INIT {color[0], color[1], color[2], color[3]}
-    va[0] = (struct vertex){ {nx0, ny0}, {tx0 / tex_w, ty0 / tex_h}, COLOR_INIT };
-    va[1] = (struct vertex){ {nx0, ny1}, {tx0 / tex_w, ty1 / tex_h}, COLOR_INIT };
-    va[2] = (struct vertex){ {nx1, ny0}, {tx1 / tex_w, ty0 / tex_h}, COLOR_INIT };
-    va[3] = (struct vertex){ {nx1, ny1}, {tx1 / tex_w, ty1 / tex_h}, COLOR_INIT };
+    va[0] = (struct vertex){ {x0, y0}, {tx0 / tex_w, ty0 / tex_h}, COLOR_INIT };
+    va[1] = (struct vertex){ {x0, y1}, {tx0 / tex_w, ty1 / tex_h}, COLOR_INIT };
+    va[2] = (struct vertex){ {x1, y0}, {tx1 / tex_w, ty0 / tex_h}, COLOR_INIT };
+    va[3] = (struct vertex){ {x1, y1}, {tx1 / tex_w, ty1 / tex_h}, COLOR_INIT };
     va[4] = va[2];
     va[5] = va[1];
 #undef COLOR_INIT

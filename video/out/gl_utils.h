@@ -88,6 +88,13 @@ void fbotex_set_filter(struct fbotex *fbo, GLenum gl_filter);
 
 void gl_matrix_ortho2d(float m[3][3], float x0, float x1, float y0, float y1);
 
+static inline void gl_matrix_mul_vec(float m[3][3], float *x, float *y)
+{
+    float vx = *x, vy = *y;
+    *x = vx * m[0][0] + vy * m[1][0] + m[2][0];
+    *y = vx * m[0][1] + vy * m[1][1] + m[2][1];
+}
+
 void gl_set_debug_logger(GL *gl, struct mp_log *log);
 
 struct gl_shader_cache;

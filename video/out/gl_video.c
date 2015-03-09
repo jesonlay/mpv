@@ -788,10 +788,8 @@ static void render_pass_quad(struct gl_video *p, int vp_w, int vp_h,
 
     float x[2] = {dst->x0, dst->x1};
     float y[2] = {dst->y0, dst->y1};
-    for (int n = 0; n < 2; n++) {
-        x[n] = x[n] * matrix[0][0] + y[n] * matrix[1][0] + matrix[2][0];
-        y[n] = x[n] * matrix[0][1] + y[n] * matrix[1][1] + matrix[2][1];
-    }
+    gl_matrix_mul_vec(matrix, &x[0], &y[0]);
+    gl_matrix_mul_vec(matrix, &x[1], &y[1]);
 
     for (int n = 0; n < 4; n++) {
         struct vertex *v = &va[n];
