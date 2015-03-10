@@ -127,13 +127,20 @@ struct fbosurface {
 
 #define FBOSURFACES_MAX 4
 
+// Orthogonal affine transformation
+struct transform {
+    float scale[2], offset[2];
+};
+
+struct rect_f {
+    float x0, y0, x1, y1;
+};
+
 struct src_tex {
     GLuint gl_tex;
     GLenum gl_target;
     int tex_w, tex_h;
-    struct {
-        float x0, y0, x1, y1;
-    } src;
+    struct rect_f src;
 };
 
 struct gl_video {
@@ -588,11 +595,14 @@ static void pass_load_fbotex(struct gl_video *p, struct fbotex *src_fbo, int id,
 }
 
 static void pass_set_image_textures(struct gl_video *p, struct video_image *vimg,
-                                    float chroma_offset[2])
+                                    struct transform *chroma)
 {
     GLuint imgtex[4] = {0};
 
     assert(vimg->mpi);
+
+    float ls_w = 1.0 / (1 << p->image_desc.chroma_xs);
+    float ls_h = 1.0 / (1 << p->image_desc.chroma_ys);
 
     int chroma_loc = p->opts.chroma_location;
     if (!chroma_loc)
@@ -605,12 +615,19 @@ static void pass_set_image_textures(struct gl_video *p, struct video_image *vimg
         // so that the luma and chroma sample line up exactly.
         // For 4:4:4, setting chroma location should have no effect at all.
         // luma sample size (in chroma coord. space)
-        float ls_w = 1.0 / (1 << p->image_desc.chroma_xs);
-        float ls_h = 1.0 / (1 << p->image_desc.chroma_ys);
-        // move chroma center to luma center (in chroma coord. space)
-        chroma_offset[0] = ls_w < 1 ? ls_w * -cx / 2 : 0;
-        chroma_offset[1] = ls_h < 1 ? ls_h * -cy / 2 : 0;
+        chroma->offset[0] = ls_w < 1 ? ls_w * -cx / 2 : 0;
+        chroma->offset[1] = ls_h < 1 ? ls_h * -cy / 2 : 0;
+    } else {
+        chroma->offset[0] = chroma->offset[1] = 0.0;
     }
+
+    // Make sure luma/chroma sizes are aligned.
+    // Example: For 4:2:0 with size 3x3, the subsampled chroma plane is 2x2
+    // so luma (3,3) has to align with chroma (2,2), in the coordinate space
+    chroma->scale[0] = ls_w * (double)vimg->planes[0].tex_w
+                                    / vimg->planes[1].tex_w;
+    chroma->scale[1] = ls_h * (double)vimg->planes[0].tex_h
+                                    / vimg->planes[1].tex_h;
 
     if (p->hwdec_active) {
         p->hwdec->driver->map_image(p->hwdec, vimg->mpi, imgtex);
@@ -626,20 +643,17 @@ static void pass_set_image_textures(struct gl_video *p, struct video_image *vimg
             .gl_target = t->gl_target,
             .tex_w = t->tex_w,
             .tex_h = t->tex_h,
-            //.src = {0, 0, t->w, t->h},
-            .src = {
-                // xxx this is wrong; we want to crop the source when sampling
-                // from indirect_fbo, but not when rendering to indirect_fbo
-                // also, this should apply offset, and take care of odd video
-                // dimensions properly; and it should use floats instead
-                // note: offset is handled elsewhere now
-                .x0 = p->src_rect.x0 >> p->image_desc.xs[n],
-                .y0 = p->src_rect.y0 >> p->image_desc.ys[n],
-                .x1 = p->src_rect.x1 >> p->image_desc.xs[n],
-                .y1 = p->src_rect.y1 >> p->image_desc.ys[n],
-            },
+            .src = {0, 0, t->w, t->h},
         };
     }
+}
+
+static void transform_rect(struct transform t, struct rect_f *r)
+{
+    r->x0 = r->x0 * t.scale[0] + t.offset[0];
+    r->x1 = r->x1 * t.scale[0] + t.offset[0];
+    r->y0 = r->y0 * t.scale[1] + t.offset[1];
+    r->y1 = r->y1 * t.scale[1] + t.offset[1];
 }
 
 static int align_pow2(int s)
@@ -1005,17 +1019,19 @@ static void pass_sample_separated_gen(struct gl_video *p, struct scaler *scaler,
 }
 
 static void pass_sample_separated(struct gl_video *p, struct scaler *scaler,
-                                  int w, int h, float offset[2])
+                                  int w, int h, struct transform t)
 {
+    // Split the transform into vertical and horizontal components.
+    struct transform tv = t, th = t;
+    tv.scale[0] = 1; tv.offset[0] = 0;
+    th.scale[1] = 1; th.offset[1] = 0;
     GLSLF("// pass 1\n");
-    p->pass_tex[0].src.y0 += offset[1];
-    p->pass_tex[0].src.y1 += offset[1];
+    transform_rect(tv, &p->pass_tex[0].src);
     pass_sample_separated_gen(p, scaler, 0, 1);
     int src_w = p->pass_tex[0].src.x1 - p->pass_tex[0].src.x0;
-    finish_pass_fbo(p, &scaler->sep_fbo, src_w, h, 0);
+    finish_pass_fbo(p, &scaler->sep_fbo, src_w, h, FBOTEX_FUZZY_H);
     GLSLF("// pass 2\n");
-    p->pass_tex[0].src.x0 += offset[0];
-    p->pass_tex[0].src.x1 += offset[0];
+    transform_rect(th, &p->pass_tex[0].src);
     pass_sample_separated_gen(p, scaler, 1, 0);
 }
 
@@ -1160,18 +1176,14 @@ static void pass_sample_sharpen5(struct gl_video *p, struct scaler *scaler)
 // The scaler unit is initialized by this function; in order to avoid cache
 // thrashing, the scaler unit should usually use the same parameters.
 static void pass_scale(struct gl_video *p, int scaler_unit, const char *name,
-                       double scale_factor, int w, int h, float offset[2])
+                       double scale_factor, int w, int h, struct transform t)
 {
     struct scaler *scaler = &p->scalers[scaler_unit];
     reinit_scaler(p, scaler_unit, name, scale_factor);
 
-    // Set up the offsets for everything other than separated scaling
-    if (!scaler->kernel || scaler->kernel->polar) {
-        p->pass_tex[0].src.x0 += offset[0];
-        p->pass_tex[0].src.x1 += offset[0];
-        p->pass_tex[0].src.y0 += offset[1];
-        p->pass_tex[0].src.y1 += offset[1];
-    }
+    // Set up the transformation for everything other than separated scaling
+    if (!scaler->kernel || scaler->kernel->polar)
+        transform_rect(t, &p->pass_tex[0].src);
 
     // Dispatch the scaler. They're all wildly different.
     if (strcmp(scaler->name, "bilinear") == 0) {
@@ -1185,7 +1197,7 @@ static void pass_scale(struct gl_video *p, int scaler_unit, const char *name,
     } else if (scaler->kernel && scaler->kernel->polar) {
         pass_sample_polar(p, scaler);
     } else if (scaler->kernel) {
-        pass_sample_separated(p, scaler, w, h, offset);
+        pass_sample_separated(p, scaler, w, h, t);
     } else {
         // Should never happen
         abort();
@@ -1209,8 +1221,8 @@ static bool input_is_subsampled(struct gl_video *p)
 // (not sure how exactly this should involve the resamplers)
 static void pass_read_video(struct gl_video *p)
 {
-    float offset[2] = {0};
-    pass_set_image_textures(p, &p->image, offset);
+    struct transform chromafix;
+    pass_set_image_textures(p, &p->image, &chromafix);
 
     if (p->plane_count == 1) {
         GLSL(vec4 color = texture(texture0, texcoord0);)
@@ -1238,22 +1250,19 @@ static void pass_read_video(struct gl_video *p)
             finish_pass_fbo(p, &p->chroma_merge_fbo, c_w, c_h, 0);
         }
         GLSLF("// chroma scaling\n");
-        pass_scale(p, 1, cscale, 1.0, p->image_w, p->image_h, offset);
+        pass_scale(p, 1, cscale, 1.0, p->image_w, p->image_h, chromafix);
         GLSL(vec2 chroma = color.rg;)
         // Always force rendering to a FBO before main scaling, or we would
         // scale chroma incorrectly.
         p->use_indirect = true;
     } else {
-        // Set the offset manually for the implicit case
-        p->pass_tex[0].src.x0 += offset[0];
-        p->pass_tex[0].src.x1 += offset[0];
-        p->pass_tex[0].src.y0 += offset[1];
-        p->pass_tex[0].src.y1 += offset[1];
-
         GLSL(vec4 color;)
         if (p->plane_count == 2) {
+            transform_rect(chromafix, &p->pass_tex[0].src);
             GLSL(vec2 chroma = texture(texture0, texcoord0).rg;) // NV formats
         } else {
+            transform_rect(chromafix, &p->pass_tex[0].src);
+            transform_rect(chromafix, &p->pass_tex[2].src);
             GLSL(vec2 chroma = vec2(texture(texture0, texcoord0).r,
                                     texture(texture2, texcoord2).r);)
         }
@@ -1434,15 +1443,33 @@ static void pass_render_main(struct gl_video *p)
                 sig_center, sig_scale, sig_offset, sig_slope);
     }
 
+    // Compute the cropped transformation
+    struct transform t = {
+        .scale = {(p->src_rect.x1 - p->src_rect.x0) / (double)p->image_w,
+                  (p->src_rect.y1 - p->src_rect.y0) / (double)p->image_h},
+        .offset = {p->src_rect.x0, p->src_rect.y0}
+    };
+
     GLSLF("// main scaling\n");
     if (!p->use_indirect && strcmp(scaler, "bilinear") == 0) {
-        // implicitly scale in pass_video_to_screen
+        // implicitly scale in pass_video_to_screen, but set up the textures
+        // manually (for cropping etc.). Special care has to be taken for the
+        // chroma planes (everything except luma=tex1), to make sure the offset
+        // is scaled to the correct reference frame (in the case of subsampled
+        // input)
+        struct transform tc = {
+            .scale = {t.scale[0], t.scale[1]},
+            .offset = {t.offset[0] / (1 << p->image_desc.chroma_xs),
+                       t.offset[1] / (1 << p->image_desc.chroma_ys)},
+        };
+        for (int n = 0; n < p->plane_count; n++)
+            transform_rect(n == 1 ? t : tc, &p->pass_tex[n].src);
     } else {
         finish_pass_fbo(p, &p->indirect_fbo, p->image_w, p->image_h, 0);
 
         int w = p->dst_rect.x1 - p->dst_rect.x0;
         int h = p->dst_rect.y1 - p->dst_rect.y0;
-        pass_scale(p, 0, scaler, scale_factor, w, h, (float[]){0, 0});
+        pass_scale(p, 0, scaler, scale_factor, w, h, t);
     }
 
     GLSLF("// scaler post-conversion\n");
