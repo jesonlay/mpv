@@ -125,7 +125,7 @@ struct fbosurface {
     int64_t pts;
 };
 
-#define FBOSURFACES_MAX 8
+#define FBOSURFACES_MAX 4
 
 struct src_tex {
     GLuint gl_tex;
@@ -1649,7 +1649,18 @@ static void gl_video_interpolate_frame(struct gl_video *p, int fbo,
         p->surface_idx = p->surface_now;
     }
 
-    // Draw the right mix of frames to the screen.
+    // Render a new frame if it came in and there's room in the queue
+    size_t surface_dst = fbosurface_next(p->surface_idx);
+    if (t && surface_dst != p->surface_now &&
+             p->surfaces[p->surface_idx].pts < t->pts) {
+        MP_STATS(p, "new-pts");
+        pass_draw_frame(p);
+        finish_pass_fbo(p, &p->surfaces[surface_dst].fbotex, vp_w, vp_h, fuzz);
+        p->surfaces[surface_dst].pts = t->pts;
+        p->surface_idx = surface_dst;
+    }
+
+    // Finally, draw the right mix of frames to the screen.
     pass_load_fbotex(p, &p->surfaces[p->surface_now].fbotex, 0, vp_w, vp_h);
     if (!t || p->surfaces[surface_nxt].pts < p->surfaces[p->surface_now].pts) {
         // No next frame available (eg. start of playback, after reconfigure
@@ -1683,17 +1694,6 @@ static void gl_video_interpolate_frame(struct gl_video *p, int fbo,
             p->surface_now = surface_nxt;
     }
     pass_draw_to_screen(p, fbo);
-
-    // Render a new frame if it came in and there's room in the queue
-    size_t surface_dst = fbosurface_next(p->surface_idx);
-    if (t && surface_dst != p->surface_now &&
-             p->surfaces[p->surface_idx].pts < t->pts) {
-        MP_STATS(p, "new-pts");
-        pass_draw_frame(p);
-        finish_pass_fbo(p, &p->surfaces[surface_dst].fbotex, vp_w, vp_h, fuzz);
-        p->surfaces[surface_dst].pts = t->pts;
-        p->surface_idx = surface_dst;
-    }
 }
 
 // (fbo==0 makes BindFramebuffer select the screen backbuffer)
