@@ -1169,7 +1169,7 @@ static void pass_sample_sharpen5(struct gl_video *p, struct scaler *scaler)
 // Scale. This uses the p->pass_tex[0] texture as source. It's hardcoded to
 // use all variables and values associated with p->pass_tex[0] (which includes
 // texture0/texcoord0/texture_size0).
-// The src rectangle is implicit in p->pass_tex + offset.
+// The src rectangle is implicit in p->pass_tex + transform.
 // The dst rectangle is implicit by what the caller will do next, but w and h
 // must still be what is going to be used (to dimension FBOs correctly).
 // This will declare "vec4 color;", which contains the scaled contents.
@@ -1218,7 +1218,6 @@ static bool input_is_subsampled(struct gl_video *p)
 }
 
 // sample from video textures, set "color" variable to yuv value
-// (not sure how exactly this should involve the resamplers)
 static void pass_read_video(struct gl_video *p)
 {
     struct transform chromafix;
