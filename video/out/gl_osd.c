@@ -184,8 +184,7 @@ static bool upload_pbo(struct mpgl_osd *ctx, struct mpgl_osd_part *osd,
         if (!gl->UnmapBuffer(GL_PIXEL_UNPACK_BUFFER))
             success = false;
         glUploadTex(gl, GL_TEXTURE_2D, fmt.format, fmt.type, NULL, stride,
-                    bb[0].x, bb[0].y, bb[1].x - bb[0].x, bb[1].y - bb[0].y,
-                    0);
+                    bb[0].x, bb[0].y, bb[1].x - bb[0].x, bb[1].y - bb[0].y, 0);
     }
     gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
@@ -330,9 +329,9 @@ static int generate_verts(struct mpgl_osd_part *part, float matrix[3][3])
                             (c >> 8) & 0xff, 255 - (c & 0xff) };
 
         write_quad(&va[n * 6], matrix,
-                b->x, b->y, b->x + b->dw, b->y + b->dh,
-                pos.x, pos.y, pos.x + b->w, pos.y + b->h,
-                part->w, part->h, color);
+                   b->x, b->y, b->x + b->dw, b->y + b->dh,
+                   pos.x, pos.y, pos.x + b->w, pos.y + b->h,
+                   part->w, part->h, color);
     }
 
     return num_vertices;

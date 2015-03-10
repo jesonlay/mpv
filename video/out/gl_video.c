@@ -178,17 +178,14 @@ struct gl_video {
     bool is_yuv, is_rgb, is_packed_yuv;
     bool has_alpha;
     char color_swizzle[5];
-    float chroma_fix[2];
 
     bool user_gamma_enabled;
-    bool sigmoid_enabled;
 
     struct video_image image;
 
     struct fbotex indirect_fbo;         // RGB target
     struct fbotex chroma_merge_fbo;
     struct fbosurface surfaces[FBOSURFACES_MAX];
-    bool use_indirect;
 
     size_t surface_idx;
     size_t surface_now;
@@ -202,11 +199,11 @@ struct gl_video {
     struct mp_rect src_rect;    // displayed part of the source video
     struct mp_rect dst_rect;    // video rectangle on output window
     struct mp_osd_res osd_rect; // OSD size/margins
-    struct mp_rect window;
-    bool vp_vflipped;
+    int vp_w, vp_h;
 
     // temporary during rendering
     struct src_tex pass_tex[4];
+    bool use_indirect;
 
     int frames_rendered;
 
@@ -216,8 +213,6 @@ struct gl_video {
 
     struct gl_hwdec *hwdec;
     bool hwdec_active;
-
-    void *scratch;
 };
 
 struct fmt_entry {
@@ -504,7 +499,8 @@ static void gl_video_reset_surfaces(struct gl_video *p)
     p->surface_now = 0;
 }
 
-static size_t fbosurface_next(size_t id) {
+static size_t fbosurface_next(size_t id)
+{
     return (id+1) % FBOSURFACES_MAX;
 }
 
@@ -518,16 +514,11 @@ static void recreate_osd(struct gl_video *p)
 
 static void reinit_rendering(struct gl_video *p)
 {
-    //GL *gl = p->gl;
-
     MP_VERBOSE(p, "Reinit rendering.\n");
 
     debug_check_gl(p, "before scaler initialization");
 
     uninit_rendering(p);
-
-    if (!p->image_params.imgfmt)
-        return;
 
     recreate_osd(p);
 }
@@ -1654,7 +1645,7 @@ static void pass_draw_frame(struct gl_video *p)
 static void pass_draw_to_screen(struct gl_video *p, int fbo)
 {
     pass_dither(p);
-    finish_pass_direct(p, fbo, p->window.x1, -p->window.y1, &p->dst_rect);
+    finish_pass_direct(p, fbo, p->vp_w, p->vp_h, &p->dst_rect);
 }
 
 // Draws an interpolate frame to fbo, based on the frame timing in t
@@ -1728,8 +1719,10 @@ void gl_video_render_frame(struct gl_video *p, int fbo, struct frame_timing *t)
     GL *gl = p->gl;
     struct video_image *vimg = &p->image;
 
-    if (p->dst_rect.x0 > p->window.x0 || p->dst_rect.y0 > p->window.y0
-        || p->dst_rect.x1 < p->window.x1 || p->dst_rect.y1 < p->window.y1)
+    gl->BindFramebuffer(GL_FRAMEBUFFER, fbo);
+
+    if (p->dst_rect.x0 > 0 || p->dst_rect.y0 > 0
+        || p->dst_rect.x1 < p->vp_w || p->dst_rect.y1 < abs(p->vp_h))
     {
         gl->Clear(GL_COLOR_BUFFER_BIT);
     }
@@ -1748,14 +1741,14 @@ void gl_video_render_frame(struct gl_video *p, int fbo, struct frame_timing *t)
         pass_draw_to_screen(p, fbo);
     }
 
-    p->frames_rendered++;
-
     debug_check_gl(p, "after video rendering");
 
     if (p->hwdec_active)
         p->hwdec->driver->unmap_image(p->hwdec);
 
 draw_osd:
+
+    gl->BindFramebuffer(GL_FRAMEBUFFER, fbo);
 
     mpgl_osd_generate(p->osd, p->osd_rect, p->osd_pts, p->image_params.stereo_out);
 
@@ -1781,25 +1774,28 @@ draw_osd:
         }
         gl_sc_set_vao(p->sc, mpgl_osd_get_vao(p->osd));
         gl_sc_gen_shader_and_reset(p->sc);
-        mpgl_osd_draw_part(p->osd, p->window.x1, -p->window.y1, n);
+        mpgl_osd_draw_part(p->osd, p->vp_w, p->vp_h, n);
     }
 
     debug_check_gl(p, "after OSD rendering");
 
     gl->UseProgram(0);
     gl->BindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    p->frames_rendered++;
 }
 
-void gl_video_resize(struct gl_video *p, struct mp_rect *window,
+// vp_w/vp_h is the implicit size of the target framebuffer.
+// vp_h can be negative to flip the screen.
+void gl_video_resize(struct gl_video *p, int vp_w, int vp_h,
                      struct mp_rect *src, struct mp_rect *dst,
-                     struct mp_osd_res *osd, bool vflip)
+                     struct mp_osd_res *osd)
 {
     p->src_rect = *src;
     p->dst_rect = *dst;
     p->osd_rect = *osd;
-    p->window = *window;
-
-    p->vp_vflipped = vflip;
+    p->vp_w = vp_w;
+    p->vp_h = vp_h;
 
     gl_video_reset_surfaces(p);
 }
@@ -2279,7 +2275,6 @@ struct gl_video *gl_video_init(GL *gl, struct mp_log *log, struct osd_state *osd
             { .index = 1, .name = "bilinear" },
         },
         .sc = gl_sc_create(gl, log),
-        .scratch = talloc_zero_array(p, char *, 1),
     };
     gl_video_set_debug(p, true);
     init_gl(p);
@@ -2361,8 +2356,8 @@ static int validate_scaler_opt(struct mp_log *log, const m_option_t *opt,
 // gl_video_resize() should be called when user interaction is done.
 void gl_video_resize_redraw(struct gl_video *p, int w, int h)
 {
-    p->window.x1 = w;
-    p->window.y1 = h;
+    p->vp_w = w;
+    p->vp_h = h;
     gl_video_render_frame(p, 0, NULL);
 }
 
