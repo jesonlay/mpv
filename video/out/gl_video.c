@@ -1749,6 +1749,7 @@ void gl_video_render_frame(struct gl_video *p, int fbo, struct frame_timing *t)
 draw_osd:
 
     gl->BindFramebuffer(GL_FRAMEBUFFER, fbo);
+    gl->Viewport(0, 0, p->vp_w, abs(p->vp_h));
 
     mpgl_osd_generate(p->osd, p->osd_rect, p->osd_pts, p->image_params.stereo_out);
 
